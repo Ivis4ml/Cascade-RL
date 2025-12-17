@@ -31,6 +31,11 @@ class ModelConfig:
     dropout: float = 0.0     # Dropout rate
     rope_theta: float = 10000.0  # RoPE base frequency
 
+    # Attention Sink (StreamingLLM) settings
+    use_sink_attention: bool = False  # Enable attention sink for streaming
+    sink_size: int = 4                # Number of sink tokens to keep at the beginning
+    window_size: int = 1024           # Sliding window size for recent tokens
+
     # Small model (~125M params)
     @classmethod
     def small(cls):
@@ -128,6 +133,11 @@ class GroupedQueryAttention(nn.Module):
     """
     Grouped Query Attention (GQA) as used in GPT-OSS 20B.
     Multiple query heads share the same key/value heads.
+
+    Supports Attention Sink (StreamingLLM) for efficient long-sequence inference:
+    - Keeps sink_size initial tokens as "attention sinks"
+    - Maintains a sliding window of recent tokens
+    - Enables processing infinite-length sequences with bounded memory
     """
 
     def __init__(self, config: ModelConfig):
@@ -137,6 +147,11 @@ class GroupedQueryAttention(nn.Module):
         self.head_dim = config.d_model // config.n_heads
         self.n_rep = config.n_heads // config.n_kv_heads  # How many Q heads per KV head
 
+        # Attention Sink settings
+        self.use_sink_attention = config.use_sink_attention
+        self.sink_size = config.sink_size
+        self.window_size = config.window_size
+
         # Linear projections (no bias, following GPT-OSS)
         self.wq = nn.Linear(config.d_model, config.n_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(config.d_model, config.n_kv_heads * self.head_dim, bias=False)
@@ -144,6 +159,43 @@ class GroupedQueryAttention(nn.Module):
         self.wo = nn.Linear(config.n_heads * self.head_dim, config.d_model, bias=False)
 
         self.dropout = nn.Dropout(config.dropout)
+
+    def _apply_sink_cache(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]]
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Apply Attention Sink caching strategy.
+
+        Cache structure: [sink_tokens | ... | window_tokens]
+
+        When cache exceeds sink_size + window_size:
+        - Keep first sink_size tokens (attention sinks)
+        - Keep last window_size tokens (sliding window)
+        - Discard tokens in between
+        """
+        if kv_cache is not None:
+            k_cache, v_cache = kv_cache
+            k = torch.cat([k_cache, k], dim=2)
+            v = torch.cat([v_cache, v], dim=2)
+
+        cache_len = k.shape[2]
+        max_cache_len = self.sink_size + self.window_size
+
+        if cache_len > max_cache_len:
+            # Keep sink tokens and recent window tokens
+            k_sink = k[:, :, :self.sink_size, :]
+            v_sink = v[:, :, :self.sink_size, :]
+            k_window = k[:, :, -self.window_size:, :]
+            v_window = v[:, :, -self.window_size:, :]
+
+            k = torch.cat([k_sink, k_window], dim=2)
+            v = torch.cat([v_sink, v_window], dim=2)
+
+        new_kv_cache = (k, v)
+        return k, v, new_kv_cache
 
     def forward(
         self,
@@ -167,30 +219,41 @@ class GroupedQueryAttention(nn.Module):
         # Apply RoPE
         q, k = apply_rope(q, k, freqs_cis)
 
-        # Handle KV cache for inference
-        if kv_cache is not None:
-            k_cache, v_cache = kv_cache
-            k = torch.cat([k_cache, k], dim=2)
-            v = torch.cat([v_cache, v], dim=2)
-        new_kv_cache = (k, v)
+        # Handle KV cache
+        if self.use_sink_attention:
+            # Use Attention Sink (StreamingLLM) caching
+            k, v, new_kv_cache = self._apply_sink_cache(k, v, kv_cache)
+        else:
+            # Standard KV cache
+            if kv_cache is not None:
+                k_cache, v_cache = kv_cache
+                k = torch.cat([k_cache, k], dim=2)
+                v = torch.cat([v_cache, v], dim=2)
+            new_kv_cache = (k, v)
 
         # Expand KV heads to match Q heads (GQA)
-        k = k.repeat_interleave(self.n_rep, dim=1)
-        v = v.repeat_interleave(self.n_rep, dim=1)
+        k_expanded = k.repeat_interleave(self.n_rep, dim=1)
+        v_expanded = v.repeat_interleave(self.n_rep, dim=1)
 
         # Scaled dot-product attention
         scale = 1.0 / math.sqrt(self.head_dim)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn_weights = torch.matmul(q, k_expanded.transpose(-2, -1)) * scale
 
         # Apply causal mask
         if mask is not None:
+            # Adjust mask size for sink attention
+            if self.use_sink_attention and mask.shape[-1] != attn_weights.shape[-1]:
+                # Create new mask for sink + window
+                kv_len = attn_weights.shape[-1]
+                mask = torch.full((seq_len, kv_len), float("-inf"), device=x.device)
+                mask = torch.triu(mask, diagonal=kv_len - seq_len + 1)
             attn_weights = attn_weights + mask
 
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(q)
         attn_weights = self.dropout(attn_weights)
 
         # Apply attention to values
-        output = torch.matmul(attn_weights, v)
+        output = torch.matmul(attn_weights, v_expanded)
 
         # Reshape and project output
         output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)

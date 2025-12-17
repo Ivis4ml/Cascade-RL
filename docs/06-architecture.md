@@ -441,6 +441,85 @@ This prevents gradient explosion in deep networks.
 
 ---
 
+## Component 5: Attention Sink (StreamingLLM)
+
+### What It Does
+
+Enables processing infinite-length sequences with bounded memory by keeping:
+1. **Sink tokens**: First few tokens that absorb attention mass
+2. **Window tokens**: Recent tokens in a sliding window
+
+### The Problem
+
+Standard attention has O(n²) complexity and unbounded KV cache:
+
+```
+Token 1:     [K₁, V₁]
+Token 2:     [K₁, K₂, V₁, V₂]
+Token 3:     [K₁, K₂, K₃, V₁, V₂, V₃]
+...
+Token 10000: [K₁, K₂, ..., K₁₀₀₀₀, V₁, ..., V₁₀₀₀₀]  ← Memory explosion!
+```
+
+### The Solution
+
+Keep only sink tokens and recent window:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Standard KV Cache (unbounded):                          │
+│ [K₁][K₂][K₃][K₄][K₅][K₆][K₇]...[K₉₉₉₈][K₉₉₉₉][K₁₀₀₀₀] │
+└─────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────┐
+│ Sink Attention (bounded):                               │
+│ [K₁][K₂][K₃][K₄]  ...discarded...  [K₉₉₉₇][K₉₉₉₈][K₉₉₉₉][K₁₀₀₀₀]│
+│ └─sink tokens─┘                    └────window tokens────┘      │
+└─────────────────────────────────────────────────────────┐
+```
+
+### Why Sink Tokens?
+
+Research found that initial tokens accumulate attention even when semantically unimportant:
+
+```
+Attention pattern (typical):
+Token:    [BOS] [The] [cat] [sat] [on] [the] [mat]
+Attention: 0.4   0.1   0.1  0.15  0.1  0.05  0.1
+           ↑
+           "Sink" - high attention despite low semantic value
+```
+
+By keeping these sink tokens, the model maintains stable attention distribution.
+
+### Usage
+
+```python
+from model import ModelConfig, GPT
+
+# Enable sink attention
+config = ModelConfig.small()
+config.use_sink_attention = True
+config.sink_size = 4        # Keep first 4 tokens as sinks
+config.window_size = 1024   # Keep last 1024 tokens
+
+model = GPT(config)
+
+# Now model can handle infinite sequences with bounded memory
+# KV cache max size = sink_size + window_size = 1028 tokens
+```
+
+### Memory Comparison
+
+| Sequence Length | Standard Cache | Sink Cache (4 + 1024) |
+|-----------------|----------------|----------------------|
+| 1,000 | 1,000 tokens | 1,028 tokens |
+| 10,000 | 10,000 tokens | 1,028 tokens |
+| 100,000 | 100,000 tokens | 1,028 tokens |
+| ∞ | ∞ (OOM) | 1,028 tokens |
+
+---
+
 ## Summary Table
 
 | Component | Purpose | Key Innovation |
@@ -449,6 +528,7 @@ This prevents gradient explosion in deep networks.
 | RoPE | Position encoding | Relative positions, no learned params |
 | GQA | Attention | Shared KV heads, smaller cache |
 | SwiGLU | Activation | Gated, better gradients |
+| Sink Attention | Long sequences | Bounded memory, infinite context |
 
 ---
 
@@ -458,6 +538,7 @@ This prevents gradient explosion in deep networks.
 - [RoPE Paper](https://arxiv.org/abs/2104.09864) - RoFormer: Enhanced Transformer with Rotary Position Embedding
 - [GQA Paper](https://arxiv.org/abs/2305.13245) - GQA: Training Generalized Multi-Query Transformer Models
 - [SwiGLU Paper](https://arxiv.org/abs/2002.05202) - GLU Variants Improve Transformer
+- [StreamingLLM Paper](https://arxiv.org/abs/2309.17453) - Efficient Streaming Language Models with Attention Sinks
 - [GPT-OSS 20B](https://huggingface.co/openai/gpt-oss-20b) - OpenAI's open-source model
 
 ---
