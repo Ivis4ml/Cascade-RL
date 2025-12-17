@@ -441,82 +441,119 @@ This prevents gradient explosion in deep networks.
 
 ---
 
-## Component 5: Attention Sink (StreamingLLM)
+## Component 5: Attention Sink (GPT-OSS Style)
 
 ### What It Does
 
-Enables processing infinite-length sequences with bounded memory by keeping:
-1. **Sink tokens**: First few tokens that absorb attention mass
-2. **Window tokens**: Recent tokens in a sliding window
+GPT-OSS introduces **learnable attention sinks** - a per-head learnable scalar parameter that allows the model to effectively "pay zero attention" when appropriate.
 
 ### The Problem
 
-Standard attention has O(n²) complexity and unbounded KV cache:
+In standard attention, the softmax must distribute 100% of attention mass across all keys:
 
 ```
-Token 1:     [K₁, V₁]
-Token 2:     [K₁, K₂, V₁, V₂]
-Token 3:     [K₁, K₂, K₃, V₁, V₂, V₃]
-...
-Token 10000: [K₁, K₂, ..., K₁₀₀₀₀, V₁, ..., V₁₀₀₀₀]  ← Memory explosion!
+Standard Attention:
+Query "What color?" attending to: [The] [red] [car] [is] [fast]
+
+Attention must sum to 1.0:
+[The]=0.1  [red]=0.4  [car]=0.2  [is]=0.1  [fast]=0.2  → Sum = 1.0
+
+But what if only "red" matters? Other tokens still get attention!
 ```
 
-### The Solution
+### The Solution: Learnable Sink
 
-Keep only sink tokens and recent window:
-
-```
-┌─────────────────────────────────────────────────────────┐
-│ Standard KV Cache (unbounded):                          │
-│ [K₁][K₂][K₃][K₄][K₅][K₆][K₇]...[K₉₉₉₈][K₉₉₉₉][K₁₀₀₀₀] │
-└─────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────┐
-│ Sink Attention (bounded):                               │
-│ [K₁][K₂][K₃][K₄]  ...discarded...  [K₉₉₉₇][K₉₉₉₈][K₉₉₉₉][K₁₀₀₀₀]│
-│ └─sink tokens─┘                    └────window tokens────┘      │
-└─────────────────────────────────────────────────────────┐
-```
-
-### Why Sink Tokens?
-
-Research found that initial tokens accumulate attention even when semantically unimportant:
+Add a learnable "sink" column to attention scores before softmax:
 
 ```
-Attention pattern (typical):
-Token:    [BOS] [The] [cat] [sat] [on] [the] [mat]
-Attention: 0.4   0.1   0.1  0.15  0.1  0.05  0.1
-           ↑
-           "Sink" - high attention despite low semantic value
+┌────────────────────────────────────────────────────────────┐
+│ Standard Attention Scores:                                  │
+│                                                             │
+│ QK = [0.5] [2.1] [1.2] [0.3] [0.8]                        │
+│       The   red   car   is   fast                          │
+│                                                             │
+│ After softmax: [0.1] [0.4] [0.2] [0.1] [0.2] = 1.0        │
+└────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────┐
+│ With Learnable Sink:                                        │
+│                                                             │
+│ QK = [0.5] [2.1] [1.2] [0.3] [0.8] [S]  ← Sink column     │
+│       The   red   car   is   fast  sink                    │
+│                                                             │
+│ After softmax: [0.05] [0.5] [0.1] [0.05] [0.1] [0.2]      │
+│                                              └─ discarded  │
+│                                                             │
+│ Final weights: [0.05] [0.5] [0.1] [0.05] [0.1] = 0.8      │
+│ (20% of attention went to sink and was discarded!)         │
+└────────────────────────────────────────────────────────────┘
 ```
 
-By keeping these sink tokens, the model maintains stable attention distribution.
+### Code Implementation
+
+```python
+# In attention forward pass:
+
+# 1. Compute standard attention scores
+attn_scores = (Q @ K.T) / sqrt(d_k)  # [B, heads, seq, kv_len]
+
+# 2. Add learnable sink column (one scalar per head)
+sink_scores = self.sinks.view(1, n_heads, 1, 1)  # [1, heads, 1, 1]
+attn_scores = torch.cat([attn_scores, sink_scores], dim=-1)  # [..., kv_len+1]
+
+# 3. Softmax includes sink
+attn_weights = softmax(attn_scores, dim=-1)  # [..., kv_len+1]
+
+# 4. Remove sink column (discard that attention mass)
+attn_weights = attn_weights[..., :-1]  # [..., kv_len]
+
+# 5. Apply to values (with potentially < 1.0 total attention)
+output = attn_weights @ V
+```
+
+### Why This Works
+
+- **Learnable**: Each head learns when to use the sink
+- **Adaptive**: Different heads can have different sink behaviors
+- **No extra memory**: Just one scalar per head
+- **Training signal**: Gradients flow through the sink parameter
 
 ### Usage
 
 ```python
 from model import ModelConfig, GPT
 
-# Enable sink attention
+# Enable GPT-OSS style attention sinks
 config = ModelConfig.small()
 config.use_sink_attention = True
-config.sink_size = 4        # Keep first 4 tokens as sinks
-config.window_size = 1024   # Keep last 1024 tokens
 
 model = GPT(config)
-
-# Now model can handle infinite sequences with bounded memory
-# KV cache max size = sink_size + window_size = 1028 tokens
+# Each attention head now has a learnable sink parameter
+# Total extra params: n_layers × n_heads = 12 × 12 = 144 scalars
 ```
 
-### Memory Comparison
+### Combined with Sliding Window
 
-| Sequence Length | Standard Cache | Sink Cache (4 + 1024) |
-|-----------------|----------------|----------------------|
-| 1,000 | 1,000 tokens | 1,028 tokens |
-| 10,000 | 10,000 tokens | 1,028 tokens |
-| 100,000 | 100,000 tokens | 1,028 tokens |
-| ∞ | ∞ (OOM) | 1,028 tokens |
+For long sequences, combine sinks with sliding window attention:
+
+```python
+config = ModelConfig.small()
+config.use_sink_attention = True   # Learnable sinks
+config.window_size = 1024          # Only attend to last 1024 tokens
+
+model = GPT(config)
+# Benefits:
+# 1. Bounded memory from sliding window
+# 2. Can "ignore" irrelevant tokens via sink
+```
+
+### Memory Comparison (with Sliding Window)
+
+| Sequence Length | Full Attention | Window=1024 |
+|-----------------|----------------|-------------|
+| 1,000 | 1,000 tokens | 1,000 tokens |
+| 10,000 | 10,000 tokens | 1,024 tokens |
+| 100,000 | OOM | 1,024 tokens |
 
 ---
 
