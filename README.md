@@ -19,6 +19,19 @@ A minimal, fully-functional LLM training codebase in pure PyTorch. Inspired by [
 | Activation | GELU | **SwiGLU** |
 | Linear Bias | Yes | **No** |
 
+## Documentation
+
+📚 **[Full Documentation](docs/index.md)** - Step-by-step guides with detailed explanations
+
+| Guide | Description |
+|-------|-------------|
+| [Installation](docs/01-installation.md) | Environment setup and verification |
+| [Data Preparation](docs/02-data-preparation.md) | Prepare training data |
+| [Tokenizer](docs/03-tokenizer.md) | Character-level and BPE tokenizers |
+| [Training](docs/04-training.md) | Train your model |
+| [Generation](docs/05-generation.md) | Generate text with trained models |
+| [Architecture](docs/06-architecture.md) | Deep dive into model components |
+
 ## Quick Start
 
 ### Installation
