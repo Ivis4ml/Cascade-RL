@@ -31,6 +31,7 @@ A minimal, fully-functional LLM training codebase in pure PyTorch. Inspired by [
 | [Training](docs/04-training.md) | Train your model |
 | [Generation](docs/05-generation.md) | Generate text with trained models |
 | [Architecture](docs/06-architecture.md) | Deep dive into model components |
+| [Model Configs](docs/07-model-configs.md) | Parameter relationships and scaling |
 
 ## Quick Start
 

@@ -12,6 +12,7 @@ Welcome to the Minimal LLM documentation. This guide will walk you through every
 | 4 | [Training](04-training.md) | Train your model |
 | 5 | [Generation](05-generation.md) | Generate text with trained models |
 | 6 | [Architecture](06-architecture.md) | Deep dive into model architecture |
+| 7 | [Model Configs](07-model-configs.md) | Parameter relationships and scaling |
 
 ## Overview
 
