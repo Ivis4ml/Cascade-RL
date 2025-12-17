@@ -13,6 +13,7 @@ Welcome to the Minimal LLM documentation. This guide will walk you through every
 | 5 | [Generation](05-generation.md) | Generate text with trained models |
 | 6 | [Architecture](06-architecture.md) | Deep dive into model architecture |
 | 7 | [Model Configs](07-model-configs.md) | Parameter relationships and scaling |
+| 8 | [Muon Optimizer](08-muon-optimizer.md) | Advanced optimizer for faster training |
 
 ## Overview
 
@@ -54,6 +55,7 @@ This codebase implements a minimal but complete LLM training pipeline:
 minimal-llm/
 ├── model.py          # GPT model implementation
 ├── train.py          # Training script
+├── muon.py           # Muon optimizer implementation
 ├── tokenizer.py      # Tokenizer implementations
 ├── data.py           # Data preparation utilities
 ├── generate.py       # Text generation script
@@ -65,7 +67,9 @@ minimal-llm/
     ├── 03-tokenizer.md
     ├── 04-training.md
     ├── 05-generation.md
-    └── 06-architecture.md
+    ├── 06-architecture.md
+    ├── 07-model-configs.md
+    └── 08-muon-optimizer.md
 ```
 
 ## End-to-End Example

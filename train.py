@@ -5,6 +5,7 @@ Features:
 - Mixed precision training (bfloat16/float16)
 - Gradient accumulation
 - Learning rate scheduling (warmup + cosine decay)
+- Muon optimizer support (Muon for matrices, AdamW for embeddings)
 - Gradient clipping
 - Checkpointing
 - Distributed training support (DDP)
@@ -16,7 +17,7 @@ import os
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List, Tuple
 
 import torch
 import torch.distributed as dist
@@ -24,6 +25,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
 
 from model import GPT, ModelConfig
+from muon import Muon, setup_muon_adamw_optimizers, get_muon_momentum_schedule
 
 
 @dataclass
@@ -47,6 +49,12 @@ class TrainConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
+
+    # Muon optimizer settings
+    use_muon: bool = False
+    muon_lr: float = 0.02
+    muon_momentum: float = 0.95
+    muon_momentum_warmup: int = 300  # Steps to warm up Muon momentum
 
     # LR Schedule
     warmup_iters: int = 500
@@ -159,35 +167,55 @@ def get_lr(iter_num: int, config: TrainConfig) -> float:
     return config.min_lr + coeff * (config.learning_rate - config.min_lr)
 
 
-def configure_optimizers(model: GPT, config: TrainConfig) -> torch.optim.Optimizer:
+def configure_optimizers(
+    model: GPT, config: TrainConfig
+) -> Tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.Optimizer]]:
     """
-    Configure optimizer with weight decay.
-    Apply weight decay only to 2D parameters (weights), not 1D (biases, norms).
+    Configure optimizer(s) with weight decay.
+
+    If use_muon is True, returns (adamw_optimizer, muon_optimizer).
+    If use_muon is False, returns (adamw_optimizer, None).
+
+    Muon is used for 2D matrix parameters in transformer blocks.
+    AdamW is used for embeddings, output head, biases, and norms.
     """
-    decay_params = []
-    no_decay_params = []
+    if config.use_muon:
+        # Use Muon + AdamW setup
+        adamw_opt, muon_opt = setup_muon_adamw_optimizers(
+            model,
+            muon_lr=config.muon_lr,
+            adamw_lr=config.learning_rate,
+            muon_momentum=config.muon_momentum,
+            weight_decay=config.weight_decay,
+            adamw_betas=(config.beta1, config.beta2)
+        )
+        return adamw_opt, muon_opt
+    else:
+        # Use AdamW only
+        decay_params = []
+        no_decay_params = []
 
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if param.dim() >= 2:
-            decay_params.append(param)
-        else:
-            no_decay_params.append(param)
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param.dim() >= 2:
+                decay_params.append(param)
+            else:
+                no_decay_params.append(param)
 
-    optim_groups = [
-        {"params": decay_params, "weight_decay": config.weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0}
-    ]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": config.weight_decay, "initial_lr": config.learning_rate},
+            {"params": no_decay_params, "weight_decay": 0.0, "initial_lr": config.learning_rate}
+        ]
 
-    optimizer = torch.optim.AdamW(
-        optim_groups,
-        lr=config.learning_rate,
-        betas=(config.beta1, config.beta2),
-        fused=torch.cuda.is_available()  # Use fused AdamW on CUDA
-    )
+        optimizer = torch.optim.AdamW(
+            optim_groups,
+            lr=config.learning_rate,
+            betas=(config.beta1, config.beta2),
+            fused=torch.cuda.is_available()  # Use fused AdamW on CUDA
+        )
 
-    return optimizer
+        return optimizer, None
 
 
 @torch.no_grad()
@@ -224,14 +252,21 @@ def estimate_loss(model: GPT, train_loader: DataLoader, val_loader: DataLoader,
     return losses
 
 
-def save_checkpoint(model: GPT, optimizer: torch.optim.Optimizer,
-                    iter_num: int, config: TrainConfig, model_config: ModelConfig):
+def save_checkpoint(
+    model: GPT,
+    adamw_optimizer: Optional[torch.optim.Optimizer],
+    muon_optimizer: Optional[torch.optim.Optimizer],
+    iter_num: int,
+    config: TrainConfig,
+    model_config: ModelConfig
+):
     """Save training checkpoint."""
     os.makedirs(config.checkpoint_dir, exist_ok=True)
 
     checkpoint = {
         "model": model.state_dict() if not isinstance(model, DDP) else model.module.state_dict(),
-        "optimizer": optimizer.state_dict(),
+        "adamw_optimizer": adamw_optimizer.state_dict() if adamw_optimizer else None,
+        "muon_optimizer": muon_optimizer.state_dict() if muon_optimizer else None,
         "iter_num": iter_num,
         "model_config": model_config.__dict__,
         "train_config": config.__dict__,
@@ -242,7 +277,12 @@ def save_checkpoint(model: GPT, optimizer: torch.optim.Optimizer,
     print(f"Saved checkpoint to {path}")
 
 
-def load_checkpoint(path: str, model: GPT, optimizer: Optional[torch.optim.Optimizer] = None):
+def load_checkpoint(
+    path: str,
+    model: GPT,
+    adamw_optimizer: Optional[torch.optim.Optimizer] = None,
+    muon_optimizer: Optional[torch.optim.Optimizer] = None
+):
     """Load training checkpoint."""
     checkpoint = torch.load(path, map_location="cpu")
 
@@ -251,8 +291,16 @@ def load_checkpoint(path: str, model: GPT, optimizer: Optional[torch.optim.Optim
     else:
         model.load_state_dict(checkpoint["model"])
 
-    if optimizer is not None and "optimizer" in checkpoint:
-        optimizer.load_state_dict(checkpoint["optimizer"])
+    # Load optimizer states (handles both old and new checkpoint formats)
+    if adamw_optimizer is not None:
+        if "adamw_optimizer" in checkpoint and checkpoint["adamw_optimizer"]:
+            adamw_optimizer.load_state_dict(checkpoint["adamw_optimizer"])
+        elif "optimizer" in checkpoint:  # Legacy format
+            adamw_optimizer.load_state_dict(checkpoint["optimizer"])
+
+    if muon_optimizer is not None and "muon_optimizer" in checkpoint:
+        if checkpoint["muon_optimizer"]:
+            muon_optimizer.load_state_dict(checkpoint["muon_optimizer"])
 
     return checkpoint.get("iter_num", 0)
 
@@ -329,11 +377,20 @@ def train(
         pin_memory=True
     )
 
-    # Create optimizer
-    optimizer = configure_optimizers(
+    # Create optimizer(s)
+    adamw_optimizer, muon_optimizer = configure_optimizers(
         model.module if ddp else model,
         train_config
     )
+
+    # Collect all optimizers for easy iteration
+    optimizers = [opt for opt in [adamw_optimizer, muon_optimizer] if opt is not None]
+
+    if master_process:
+        if train_config.use_muon:
+            print("Using Muon + AdamW optimizers")
+        else:
+            print("Using AdamW optimizer")
 
     # Mixed precision context
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[train_config.dtype]
@@ -343,7 +400,7 @@ def train(
     # Resume from checkpoint
     start_iter = 0
     if resume_from is not None:
-        start_iter = load_checkpoint(resume_from, model, optimizer)
+        start_iter = load_checkpoint(resume_from, model, adamw_optimizer, muon_optimizer)
         if master_process:
             print(f"Resumed from iteration {start_iter}")
 
@@ -354,13 +411,27 @@ def train(
     local_iter_num = 0
 
     for iter_num in range(start_iter, train_config.max_iters):
-        # Update learning rate
+        # Update learning rate for all optimizers
         lr = get_lr(iter_num, train_config)
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+        for opt in optimizers:
+            for param_group in opt.param_groups:
+                # Scale LR relative to initial_lr
+                initial_lr = param_group.get('initial_lr', train_config.learning_rate)
+                lr_scale = lr / train_config.learning_rate
+                param_group['lr'] = initial_lr * lr_scale
+
+        # Update Muon momentum schedule
+        if muon_optimizer is not None:
+            muon_momentum = get_muon_momentum_schedule(
+                iter_num,
+                warmup_steps=train_config.muon_momentum_warmup
+            )
+            for param_group in muon_optimizer.param_groups:
+                param_group['momentum'] = muon_momentum
 
         # Gradient accumulation loop
-        optimizer.zero_grad(set_to_none=True)
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
         loss_accum = 0.0
 
         for micro_step in range(train_config.gradient_accumulation_steps):
@@ -385,13 +456,15 @@ def train(
 
         # Gradient clipping
         if train_config.grad_clip > 0:
-            scaler.unscale_(optimizer)
+            for opt in optimizers:
+                scaler.unscale_(opt)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
         else:
             grad_norm = 0.0
 
         # Optimizer step
-        scaler.step(optimizer)
+        for opt in optimizers:
+            scaler.step(opt)
         scaler.update()
 
         # Logging
@@ -420,13 +493,13 @@ def train(
 
         # Checkpointing
         if iter_num > 0 and iter_num % train_config.save_interval == 0 and master_process:
-            save_checkpoint(model, optimizer, iter_num, train_config, model_config)
+            save_checkpoint(model, adamw_optimizer, muon_optimizer, iter_num, train_config, model_config)
 
         local_iter_num += 1
 
     # Save final checkpoint
     if master_process:
-        save_checkpoint(model, optimizer, train_config.max_iters, train_config, model_config)
+        save_checkpoint(model, adamw_optimizer, muon_optimizer, train_config.max_iters, train_config, model_config)
         print("Training complete!")
 
     if ddp:
@@ -453,6 +526,14 @@ def main():
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--eval-interval", type=int, default=500)
+
+    # Muon optimizer
+    parser.add_argument("--use-muon", action="store_true",
+                        help="Use Muon optimizer for matrix params (recommended)")
+    parser.add_argument("--muon-lr", type=float, default=0.02,
+                        help="Learning rate for Muon optimizer")
+    parser.add_argument("--muon-momentum", type=float, default=0.95,
+                        help="Momentum for Muon optimizer")
 
     # Data
     parser.add_argument("--data-path", type=str, default=None,
@@ -499,6 +580,9 @@ def main():
         compile=args.compile,
         log_interval=args.log_interval,
         eval_interval=args.eval_interval,
+        use_muon=args.use_muon,
+        muon_lr=args.muon_lr,
+        muon_momentum=args.muon_momentum,
     )
 
     train(model_config, train_config, args.data_path, args.resume_from)

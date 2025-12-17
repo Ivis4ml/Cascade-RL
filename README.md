@@ -6,8 +6,9 @@ A minimal, fully-functional LLM training codebase in pure PyTorch. Inspired by [
 
 - **Pure PyTorch** - No external dependencies beyond PyTorch and NumPy
 - **Modern Architecture** - RMSNorm, RoPE, GQA, SwiGLU (GPT-OSS 20B style)
+- **Muon Optimizer** - Newton-Schulz orthogonalized optimizer for faster training
 - **Production Ready** - Mixed precision, gradient accumulation, DDP support
-- **Minimal & Readable** - ~1500 lines of well-documented code
+- **Minimal & Readable** - ~1700 lines of well-documented code
 
 ### Architecture Comparison
 
@@ -32,6 +33,7 @@ A minimal, fully-functional LLM training codebase in pure PyTorch. Inspired by [
 | [Generation](docs/05-generation.md) | Generate text with trained models |
 | [Architecture](docs/06-architecture.md) | Deep dive into model components |
 | [Model Configs](docs/07-model-configs.md) | Parameter relationships and scaling |
+| [Muon Optimizer](docs/08-muon-optimizer.md) | Advanced optimizer for faster training |
 
 ## Quick Start
 
@@ -67,6 +69,7 @@ python generate.py \
 ```
 ├── model.py        # GPT model with RMSNorm, RoPE, GQA, SwiGLU
 ├── train.py        # Training loop with mixed precision & DDP
+├── muon.py         # Muon optimizer (Newton-Schulz orthogonalized)
 ├── tokenizer.py    # Character-level and BPE tokenizers
 ├── data.py         # Data preparation utilities
 ├── generate.py     # Text generation / inference
@@ -91,7 +94,15 @@ python generate.py \
 # Basic training with synthetic data (for testing)
 python train.py --model-size small --max-iters 100
 
-# Train on custom data
+# Train with Muon optimizer (recommended for faster convergence)
+python train.py \
+    --data-path path/to/data.bin \
+    --model-size medium \
+    --use-muon \
+    --muon-lr 0.02 \
+    --max-iters 10000
+
+# Train on custom data with AdamW only
 python train.py \
     --data-path path/to/data.bin \
     --model-size medium \
@@ -230,6 +241,7 @@ tokens = tok.encode("Hello World")
 
 - [nanochat](https://github.com/karpathy/nanochat) - Karpathy's minimal chat model
 - [GPT-OSS 20B](https://huggingface.co/openai/gpt-oss-20b) - OpenAI's open-source model
+- [Muon Optimizer](https://github.com/KellerJordan/Muon) - Newton-Schulz orthogonalized optimizer
 - [RoPE Paper](https://arxiv.org/abs/2104.09864) - Rotary Position Embedding
 - [GQA Paper](https://arxiv.org/abs/2305.13245) - Grouped Query Attention
 - [SwiGLU Paper](https://arxiv.org/abs/2002.05202) - GLU Variants
