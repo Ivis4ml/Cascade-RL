@@ -94,8 +94,14 @@ class BPETokenizer:
                 raise NotImplementedError("SentencePiece requires a trained model file")
             except ImportError:
                 raise ImportError(
-                    "Neither tiktoken nor sentencepiece is installed. "
-                    "Install with: pip install tiktoken"
+                    "Neither tiktoken nor sentencepiece is installed.\n"
+                    "tiktoken requires Rust compiler to build from source.\n\n"
+                    "Options:\n"
+                    "1. Install pre-built wheel: pip install tiktoken --only-binary :all:\n"
+                    "2. Install Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh\n"
+                    "3. Use CharTokenizer instead (no external deps):\n"
+                    "   from tokenizer import CharTokenizer\n"
+                    "   tok = CharTokenizer.from_file('data/train.txt')"
                 )
 
     def encode(self, text: str) -> List[int]:
